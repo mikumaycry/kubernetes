@@ -49,10 +49,22 @@ type grpcTunnel struct {
 	conns           map[int64]*conn
 	pendingDialLock sync.RWMutex
 	connsLock       sync.RWMutex
+
+	// The tunnel will be closed if the caller fails to read via conn.Read()
+	// more than readTimeoutSeconds after a packet has been received.
+	readTimeoutSeconds int
 }
+
+type clientConn interface {
+	Close() error
+}
+
+var _ clientConn = &grpc.ClientConn{}
 
 // CreateGrpcTunnel creates a Tunnel to dial to a remote server through a
 // gRPC based proxy service.
+// Currently, a single tunnel supports a single connection, and the tunnel is closed when the connection is terminated
+// The Dial() method of the returned tunnel should only be called once
 func CreateGrpcTunnel(address string, opts ...grpc.DialOption) (Tunnel, error) {
 	c, err := grpc.Dial(address, opts...)
 	if err != nil {
@@ -67,28 +79,31 @@ func CreateGrpcTunnel(address string, opts ...grpc.DialOption) (Tunnel, error) {
 	}
 
 	tunnel := &grpcTunnel{
-		stream:      stream,
-		pendingDial: make(map[int64]chan<- dialResult),
-		conns:       make(map[int64]*conn),
+		stream:             stream,
+		pendingDial:        make(map[int64]chan<- dialResult),
+		conns:              make(map[int64]*conn),
+		readTimeoutSeconds: 10,
 	}
 
-	go tunnel.serve()
+	go tunnel.serve(c)
 
 	return tunnel, nil
 }
 
-func (t *grpcTunnel) serve() {
+func (t *grpcTunnel) serve(c clientConn) {
+	defer c.Close()
+
 	for {
 		pkt, err := t.stream.Recv()
 		if err == io.EOF {
 			return
 		}
 		if err != nil || pkt == nil {
-			klog.Warningf("stream read error: %v", err)
+			klog.Errorf("stream read failure: %s", err)
 			return
 		}
 
-		klog.V(6).Infof("[tracing] recv packet, type: %s", pkt.Type)
+		klog.V(6).Infof("[tracing] recv packet type: %s", pkt.Type)
 
 		switch pkt.Type {
 		case client.PacketType_DIAL_RSP:
@@ -98,13 +113,26 @@ func (t *grpcTunnel) serve() {
 			t.pendingDialLock.RUnlock()
 
 			if !ok {
-				klog.Warning("DialResp not recognized; dropped")
+				klog.V(1).Infoln("DialResp not recognized; dropped")
 			} else {
-				ch <- dialResult{
+				result := dialResult{
 					err:    resp.Error,
 					connid: resp.ConnectID,
 				}
+				select {
+				case ch <- result:
+				default:
+					klog.Errorf("blocked pending channel: Received second dial response for connection request connectionID: %d: dialID: %d", resp.ConnectID, resp.Random)
+					// On multiple dial responses, avoid leaking serve goroutine.
+					return
+				}
 			}
+
+			if resp.Error != "" {
+				// On dial error, avoid leaking serve goroutine.
+				return
+			}
+
 		case client.PacketType_DATA:
 			resp := pkt.GetData()
 			// TODO: flow control
@@ -113,9 +141,16 @@ func (t *grpcTunnel) serve() {
 			t.connsLock.RUnlock()
 
 			if ok {
-				conn.readCh <- resp.Data
+				timer := time.NewTimer((time.Duration)(t.readTimeoutSeconds) * time.Second)
+				select {
+				case conn.readCh <- resp.Data:
+					timer.Stop()
+				case <-timer.C:
+					klog.Errorf("timeout: readTimeout has been reached, the grpc connection to the proxy server will be closed: connectionID: %d: readTimeoutSeconds: %d", conn.connID, t.readTimeoutSeconds)
+					return
+				}
 			} else {
-				klog.Warningf("connection id %d not recognized", resp.ConnectID)
+				klog.V(1).Infof("connection not recognized: connectionID: %d", resp.ConnectID)
 			}
 		case client.PacketType_CLOSE_RSP:
 			resp := pkt.GetCloseResponse()
@@ -130,9 +165,9 @@ func (t *grpcTunnel) serve() {
 				t.connsLock.Lock()
 				delete(t.conns, resp.ConnectID)
 				t.connsLock.Unlock()
-			} else {
-				klog.Warningf("connection id %d not recognized", resp.ConnectID)
+				return
 			}
+			klog.V(1).Infof("connection not recognized: connectionID: %d", resp.ConnectID)
 		}
 	}
 }
@@ -144,8 +179,8 @@ func (t *grpcTunnel) Dial(protocol, address string) (net.Conn, error) {
 		return nil, errors.New("protocol not supported")
 	}
 
-	random := rand.Int63()
-	resCh := make(chan dialResult)
+	random := rand.Int63() /* #nosec G404 */
+	resCh := make(chan dialResult, 1)
 	t.pendingDialLock.Lock()
 	t.pendingDial[random] = resCh
 	t.pendingDialLock.Unlock()
@@ -165,14 +200,14 @@ func (t *grpcTunnel) Dial(protocol, address string) (net.Conn, error) {
 			},
 		},
 	}
-	klog.V(6).Infof("[tracing] send packet, type: %s", req.Type)
+	klog.V(6).Infof("[tracing] send packet: type: %s", req.Type)
 
 	err := t.stream.Send(req)
 	if err != nil {
 		return nil, err
 	}
 
-	klog.Info("DIAL_REQ sent to proxy server")
+	klog.V(5).Infoln("DIAL_REQ sent to proxy server")
 
 	c := &conn{stream: t.stream}
 
@@ -183,7 +218,7 @@ func (t *grpcTunnel) Dial(protocol, address string) (net.Conn, error) {
 		}
 		c.connID = res.connid
 		c.readCh = make(chan []byte, 10)
-		c.closeCh = make(chan string)
+		c.closeCh = make(chan string, 1)
 		t.connsLock.Lock()
 		t.conns[res.connid] = c
 		t.connsLock.Unlock()
